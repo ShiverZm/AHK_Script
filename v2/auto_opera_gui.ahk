@@ -9,6 +9,19 @@
 ; 3. 可以暂停、继续、停止执行
 ; ============================================================================
 
+; 检查并请求管理员权限
+if (!A_IsAdmin) {
+    try {
+        ; 请求管理员权限重新运行脚本
+        Run('*RunAs "' . A_ScriptFullPath . '"', , , &PID)
+        ExitApp()
+    } catch as e {
+        ; 如果用户拒绝了权限提升请求，显示提示信息
+        MsgBox("此程序需要管理员权限才能正常运行。`n`n请右键点击脚本文件，选择'以管理员身份运行'。", "需要管理员权限", "Icon!")
+        ExitApp()
+    }
+}
+
 ; 全局变量
 global actionList := []  ; 存储操作列表
 global isRunning := false  ; 是否正在执行
@@ -17,6 +30,8 @@ global timerID := 0  ; 定时器ID
 global executionCount := 0  ; 当前执行次数
 global maxExecutionCount := 0  ; 最大执行次数（0表示无限）
 global isLoopMode := false  ; 是否循环执行
+global selectedWindowHwnd := 0  ; 选中的窗口句柄
+global selectedWindowTitle := ""  ; 选中的窗口标题
 
 ; 创建GUI窗口
 MyGui := Gui("+Resize", "自动化操作控制面板")
@@ -44,13 +59,21 @@ actionListView.ModifyCol(1, 150)
 actionListView.ModifyCol(2, 120)
 
 ; 执行设置区域
-MyGui.AddText("xs y+10 w300", "执行设置：")
-MyGui.AddText("xs y+5 w100", "执行次数：")
+MyGui.AddText("xs y+5 w100", "循环次数：")
 executionCountInput := MyGui.AddEdit("x+5 yp-3 w80", "1")
 executionCountInput.ToolTip := "设置执行次数（0或留空表示无限次）"
 
 loopCheckbox := MyGui.AddCheckbox("xs y+10 w150", "循环执行")
 loopCheckbox.ToolTip := "勾选后，执行完所有操作后自动重新开始"
+
+; 窗口选择区域
+MyGui.AddText("xs y+10 w300", "目标窗口：")
+windowSelectBtn := MyGui.AddButton("xs y+5 w100", "选择窗口")
+windowSelectBtn.OnEvent("Click", SelectWindow)
+windowClearBtn := MyGui.AddButton("x+5 yp w100", "清除选择")
+windowClearBtn.OnEvent("Click", ClearWindowSelection)
+windowInfoText := MyGui.AddText("xs y+5 w300", "未选择窗口（将发送到当前活动窗口）")
+windowInfoText.SetFont("cGray")
 
 ; 控制按钮区域
 startBtn := MyGui.AddButton("xs y+10 w70", "开始执行")
@@ -93,14 +116,91 @@ actionListView.OnEvent("DoubleClick", EditAction)
 MyGui.OnEvent("Close", (*) => ExitApp())
 
 ; 显示窗口（调整大小以适应左右布局：左侧320px + 右侧350px + 间距）
-MyGui.Show("w690 h620")
+MyGui.Show("w690 h700")
 
 ; ============================================================================
 ; 函数定义
 ; ============================================================================
 
+; 最佳按键发送函数（使用窗口句柄）
+BestSendKey(Key, WindowHwnd, Method := 6) {
+    ; Method 1: keybd_event (需要激活窗口)
+    ; Method 2: SendInput (模拟物理输入，需要激活窗口)
+    ; Method 3: SendPlay (回放模式，需要激活窗口)
+    ; Method 4: PostMessage (发送Windows消息，不需要激活)
+    ; Method 5: SendMessage (发送Windows消息并等待，不需要激活)
+    ; Method 6: ControlSend (发送到控件，不需要激活，最可靠)
+    
+    if (!WindowHwnd || WindowHwnd == 0) {
+        ; 如果没有窗口句柄，使用普通Send
+        if (Method = 2) {
+            SendInput(Key)
+        } else if (Method = 3) {
+            SendPlay(Key)
+        } else {
+            Send(Key)
+        }
+        return true
+    }
+    
+    ; 检查窗口是否存在
+    if (!WinExist("ahk_id " . WindowHwnd)) {
+        return false
+    }
+    
+    if (Method = 1) {
+        ; Method 1: DllCall keybd_event (activate window first)
+        WinActivate("ahk_id " . WindowHwnd)
+        Sleep(100)
+        ; 对于通用按键，使用SendInput
+        SendInput(Key)
+        Sleep(100)
+    }
+    else if (Method = 2) {
+        ; Method 2: SendInput (simulate physical input, activate window)
+        WinActivate("ahk_id " . WindowHwnd)
+        Sleep(100)
+        SendInput(Key)
+        Sleep(100)
+    }
+    else if (Method = 3) {
+        ; Method 3: SendPlay (playback mode, activate window)
+        WinActivate("ahk_id " . WindowHwnd)
+        Sleep(50)
+        SendPlay(Key)
+        Sleep(100)
+    }
+    else if (Method = 4) {
+        ; Method 4: PostMessage (send Windows message, no activate needed)
+        ; WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101
+        ; 对于通用按键，使用ControlSend更可靠
+        ; PostMessage主要用于特定按键（如Left/Right）
+        ControlSend(Key, , "ahk_id " . WindowHwnd)
+        Sleep(100)
+    }
+    else if (Method = 5) {
+        ; Method 5: SendMessage (send Windows message and wait, no activate needed)
+        ; 对于通用按键，使用ControlSend更可靠
+        ControlSend(Key, , "ahk_id " . WindowHwnd)
+        Sleep(100)
+    }
+    else if (Method = 6) {
+        ; Method 6: ControlSend (send to control, no activate needed, most reliable)
+        ControlSend(Key, , "ahk_id " . WindowHwnd)
+        Sleep(100)
+    }
+    else {
+        ; 默认使用ControlSend
+        ControlSend(Key, , "ahk_id " . WindowHwnd)
+        Sleep(100)
+    }
+    
+    return true
+}
+
 ; 添加操作
 AddAction(*) {
+    global actionList
     key := Trim(keyInput.Value)
     interval := Trim(intervalInput.Value)
     
@@ -130,6 +230,7 @@ AddAction(*) {
 
 ; 删除操作
 DeleteAction(*) {
+    global actionList, isRunning
     selectedRow := actionListView.GetNext()
     if (selectedRow == 0) {
         MsgBox("请先选择要删除的操作！", "提示", "Icon!")
@@ -152,6 +253,7 @@ DeleteAction(*) {
 
 ; 编辑操作（双击）
 EditAction(LV, Row) {
+    global actionList, isRunning
     if (isRunning) {
         MsgBox("执行中无法编辑操作，请先停止执行！", "提示", "Icon!")
         return
@@ -209,14 +311,21 @@ EditAction(LV, Row) {
 
 ; 开始执行
 StartExecution(*) {
+    global actionList, isRunning, maxExecutionCount, isLoopMode, currentIndex, executionCount
+    
     if (actionList.Length == 0) {
         MsgBox("请先添加操作！", "提示", "Icon!")
         return
     }
     
-    if (isRunning) {
-        MsgBox("已经在执行中！", "提示", "Icon!")
-        return
+    ; 检查是否正在执行（确保 isRunning 已初始化）
+    try {
+        if (isRunning) {
+            MsgBox("已经在执行中！", "提示", "Icon!")
+            return
+        }
+    } catch {
+        isRunning := false
     }
     
     ; 读取执行设置
@@ -258,12 +367,22 @@ StartExecution(*) {
     
     UpdateStatus("正在执行...")
     
-    ; 立即执行当前操作
+    ; 启动单一计时器，立即执行第一个操作
+    ; 停止之前的计时器（如果存在）
+    SetTimer(TimerExecuteAction, 0)
+    ; 立即执行第一个操作
+    ExecuteNextAction()
+}
+
+; 单一计时器执行函数
+TimerExecuteAction() {
     ExecuteNextAction()
 }
 
 ; 执行下一个操作
 ExecuteNextAction() {
+    global actionList, isRunning, maxExecutionCount, executionCount, isLoopMode, currentIndex
+    global selectedWindowHwnd, selectedWindowTitle, windowInfoText, timerID
     if (!isRunning) {
         return
     }
@@ -292,9 +411,8 @@ ExecuteNextAction() {
             currentIndex := 0
             AddLog("第 " . executionCount . " 轮完成，开始下一轮...")
             UpdateStatus("第 " . executionCount . " 轮完成，开始下一轮...")
-            ; 继续执行第一个操作
-            Sleep(100)  ; 短暂延迟
-            ExecuteNextAction()
+            ; 继续执行第一个操作（延迟100ms后）
+            SetTimer(TimerExecuteAction, -100)
             return
         } else {
             ; 不循环，执行完毕
@@ -328,12 +446,37 @@ ExecuteNextAction() {
         ; 判断是否需要大括号包裹
         ; 如果已经包含特殊字符（^!+#）或大括号，直接发送
         ; 否则用大括号包裹
+        formattedKey := ""
         if (InStr(keyStr, "^") || InStr(keyStr, "!") || InStr(keyStr, "#") || InStr(keyStr, "{") || InStr(keyStr, "}")) {
-            ; 组合键或已格式化的按键，直接发送
-            Send(keyStr)
+            ; 组合键或已格式化的按键，直接使用
+            formattedKey := keyStr
         } else {
             ; 普通按键，用大括号包裹
-            Send("{" . keyStr . "}")
+            formattedKey := "{" . keyStr . "}"
+        }
+        
+        ; 如果选择了窗口，向指定窗口发送按键；否则发送到当前活动窗口
+        sendTarget := ""
+        if (selectedWindowHwnd != 0) {
+            ; 检查窗口是否仍然存在
+            if (WinExist("ahk_id " . selectedWindowHwnd)) {
+                ; 向指定窗口发送按键（使用BestSendKey，Method 6 = ControlSend）
+                BestSendKey(formattedKey, selectedWindowHwnd)
+                sendTarget := " [发送到: " . selectedWindowTitle . "]"
+            } else {
+                ; 窗口已关闭，清除选择并发送到当前活动窗口
+                AddLog("警告：选中的窗口已关闭，已清除窗口选择")
+                selectedWindowHwnd := 0
+                selectedWindowTitle := ""
+                windowInfoText.Value := "未选择窗口（将发送到当前活动窗口）"
+                windowInfoText.SetFont("cGray")
+                Send(formattedKey)
+                sendTarget := " [发送到当前活动窗口]"
+            }
+        } else {
+            ; 发送到当前活动窗口
+            Send(formattedKey)
+            sendTarget := " [发送到当前活动窗口]"
         }
         
         ; 更新状态显示
@@ -350,7 +493,7 @@ ExecuteNextAction() {
             countInfo := " (第" . (executionCount + 1) . "轮)"
         }
         ; 记录执行日志
-        logMessage := "执行操作 " . (currentIndex + 1) . "/" . actionList.Length . ": " . action.key
+        logMessage := "执行操作 " . (currentIndex + 1) . "/" . actionList.Length . ": " . action.key . sendTarget
         if (maxExecutionCount > 0) {
             logMessage .= " (第" . (executionCount + 1) . "/" . maxExecutionCount . "轮)"
         } else if (isLoopMode) {
@@ -366,10 +509,13 @@ ExecuteNextAction() {
     ; 移动到下一个操作
     currentIndex++
     
-    ; 如果还有操作，设置定时器执行下一个
+    ; 如果还有操作，使用单一计时器执行下一个
     if (currentIndex < actionList.Length) {
         nextAction := actionList[currentIndex + 1]
-        timerID := SetTimer(ExecuteNextAction, -nextAction.interval)
+        ; 停止之前的计时器（如果存在）
+        SetTimer(TimerExecuteAction, 0)
+        ; 设置新的计时器，使用单一计时器函数
+        SetTimer(TimerExecuteAction, -nextAction.interval)
     } else {
         ; 当前轮次的所有操作执行完毕
         executionCount++
@@ -388,9 +534,8 @@ ExecuteNextAction() {
             currentIndex := 0
             AddLog("第 " . executionCount . " 轮完成，开始下一轮...")
             UpdateStatus("第 " . executionCount . " 轮完成，开始下一轮...")
-            ; 短暂延迟后继续执行第一个操作
-            Sleep(100)
-            ExecuteNextAction()
+            ; 使用单一计时器继续执行第一个操作（延迟100ms后）
+            SetTimer(TimerExecuteAction, -100)
         } else {
             ; 不循环，执行完毕
             AddLog("========== 执行完成 ==========")
@@ -407,12 +552,13 @@ ExecuteNextAction() {
 
 ; 暂停执行
 PauseExecution(*) {
+    global isRunning, currentIndex, actionList
     if (!isRunning) {
         return
     }
     
     isRunning := false
-    SetTimer(ExecuteNextAction, 0)  ; 停止定时器
+    SetTimer(TimerExecuteAction, 0)  ; 停止单一计时器
     
     AddLog("执行已暂停 (当前进度: 第" . (currentIndex) . "/" . actionList.Length . "个操作)")
     
@@ -425,6 +571,7 @@ PauseExecution(*) {
 
 ; 停止执行
 StopExecution(*) {
+    global isRunning, currentIndex, executionCount, actionList
     isRunning := false
     
     ; 记录停止日志
@@ -436,7 +583,7 @@ StopExecution(*) {
     
     currentIndex := 0
     executionCount := 0
-    SetTimer(ExecuteNextAction, 0)  ; 停止定时器
+    SetTimer(TimerExecuteAction, 0)  ; 停止单一计时器
     
     ; 更新按钮状态
     startBtn.Enabled := true
@@ -457,6 +604,7 @@ StopExecution(*) {
 
 ; 清空列表
 ClearList(*) {
+    global actionList, isRunning
     if (isRunning) {
         MsgBox("执行中无法清空列表，请先停止执行！", "提示", "Icon!")
         return
@@ -473,6 +621,7 @@ ClearList(*) {
 
 ; 导出操作列表
 ExportActions(*) {
+    global actionList, isRunning
     if (actionList.Length == 0) {
         MsgBox("操作列表为空，无法导出！", "提示", "Icon!")
         return
@@ -518,6 +667,7 @@ ExportActions(*) {
 
 ; 导入操作列表
 ImportActions(*) {
+    global actionList, isRunning
     if (isRunning) {
         MsgBox("执行中无法导入，请先停止执行！", "提示", "Icon!")
         return
@@ -753,4 +903,101 @@ ShowKeySelector(*) {
     
     ; 显示对话框
     KeySelectorGui.Show()
+}
+
+; 选择窗口
+SelectWindow(*) {
+    global selectedWindowHwnd, selectedWindowTitle, windowInfoText
+    ; 创建提示窗口
+    tipGui := Gui("+AlwaysOnTop -Caption +ToolWindow", "选择窗口")
+    tipGui.SetFont("s12 Bold", "Microsoft YaHei UI")
+    tipGui.BackColor := "Yellow"
+    tipText := tipGui.AddText("Center w400 h120", "将鼠标移动到目标窗口上`n然后按 F1 键确认选择`n按 ESC 键取消")
+    tipGui.Show("x" . (A_ScreenWidth // 2 - 200) . " y" . (A_ScreenHeight // 2 - 60))
+    
+    ; 创建热键来捕获选择
+    f1Pressed := false
+    escPressed := false
+    
+    ; 注册热键（临时）
+    Hotkey("F1", SelectWindowConfirm, "On")
+    Hotkey("Esc", SelectWindowCancel, "On")
+    
+    SelectWindowConfirm(*) {
+        f1Pressed := true
+    }
+    
+    SelectWindowCancel(*) {
+        escPressed := true
+    }
+    
+    ; 等待用户操作
+    while (!f1Pressed && !escPressed) {
+        Sleep(50)
+        ; 实时显示当前鼠标下的窗口信息
+        MouseGetPos(, , &currentHwnd)
+        if (currentHwnd != 0) {
+            try {
+                currentTitle := WinGetTitle("ahk_id " . currentHwnd)
+                if (StrLen(currentTitle) > 40) {
+                    currentTitle := SubStr(currentTitle, 1, 37) . "..."
+                }
+                tipText.Value := "将鼠标移动到目标窗口上`n然后按 F1 键确认选择`n按 ESC 键取消`n`n当前窗口: " . currentTitle
+            }
+        }
+    }
+    
+    ; 取消热键
+    Hotkey("F1", "Off")
+    Hotkey("Esc", "Off")
+    
+    ; 关闭提示窗口
+    tipGui.Destroy()
+    
+    if (escPressed) {
+        AddLog("已取消窗口选择")
+        return
+    }
+    
+    ; 获取鼠标当前位置下的窗口
+    MouseGetPos(, , &mouseHwnd)
+    
+    if (mouseHwnd == 0) {
+        MsgBox("未能获取到窗口信息！", "错误", "Icon!")
+        return
+    }
+    
+    ; 获取窗口信息
+    try {
+        windowTitle := WinGetTitle("ahk_id " . mouseHwnd)
+        
+        ; 保存选中的窗口信息
+        selectedWindowHwnd := mouseHwnd
+        selectedWindowTitle := windowTitle
+        
+        ; 更新显示
+        displayText := "已选择窗口：" . windowTitle
+        if (StrLen(displayText) > 50) {
+            displayText := SubStr(displayText, 1, 47) . "..."
+        }
+        windowInfoText.Value := displayText
+        windowInfoText.SetFont("cGreen")
+        
+        AddLog("已选择窗口: " . windowTitle . " (句柄: " . mouseHwnd . ")")
+        UpdateStatus("已选择目标窗口：" . windowTitle)
+    } catch as e {
+        MsgBox("获取窗口信息失败：" . e.Message, "错误", "Icon!")
+        AddLog("选择窗口失败: " . e.Message)
+    }
+}
+
+; 清除窗口选择
+ClearWindowSelection(*) {
+    global selectedWindowHwnd, selectedWindowTitle, windowInfoText
+    selectedWindowHwnd := 0
+    selectedWindowTitle := ""
+    windowInfoText.Value := "未选择窗口（将发送到当前活动窗口）"
+    windowInfoText.SetFont("cGray")
+    AddLog("已清除窗口选择")
+    UpdateStatus("已清除窗口选择")
 }
