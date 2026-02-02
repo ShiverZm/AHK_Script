@@ -549,6 +549,11 @@ ImportActions(*) {
                 continue
             }
             
+            ; 跳过注释行（以"；"开头的行）
+            if (RegExMatch(line, "^；")) {
+                continue
+            }
+            
             ; 解析格式：按键：间隔时间
             ; 支持中文冒号和英文冒号
             match := ""
