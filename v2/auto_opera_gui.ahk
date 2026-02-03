@@ -27,8 +27,6 @@ global actionList := []  ; 存储操作列表
 global isRunning := false  ; 是否正在执行
 global currentIndex := 0  ; 当前执行的操作索引
 global timerID := 0  ; 定时器ID
-global executionCount := 0  ; 当前执行次数
-global maxExecutionCount := 0  ; 最大执行次数（0表示无限）
 global isLoopMode := false  ; 是否循环执行
 global selectedWindowHwnd := 0  ; 选中的窗口句柄
 global selectedWindowTitle := ""  ; 选中的窗口标题
@@ -59,11 +57,7 @@ actionListView.ModifyCol(1, 150)
 actionListView.ModifyCol(2, 120)
 
 ; 执行设置区域
-MyGui.AddText("xs y+5 w100", "循环次数：")
-executionCountInput := MyGui.AddEdit("x+5 yp-3 w80", "1")
-executionCountInput.ToolTip := "设置执行次数（0或留空表示无限次）"
-
-loopCheckbox := MyGui.AddCheckbox("xs y+10 w150", "循环执行")
+loopCheckbox := MyGui.AddCheckbox("xs y+5 w150", "循环执行")
 loopCheckbox.ToolTip := "勾选后，执行完所有操作后自动重新开始"
 
 ; 窗口选择区域
@@ -311,7 +305,7 @@ EditAction(LV, Row) {
 
 ; 开始执行
 StartExecution(*) {
-    global actionList, isRunning, maxExecutionCount, isLoopMode, currentIndex, executionCount
+    global actionList, isRunning, isLoopMode, currentIndex
     
     if (actionList.Length == 0) {
         MsgBox("请先添加操作！", "提示", "Icon!")
@@ -328,23 +322,11 @@ StartExecution(*) {
         isRunning := false
     }
     
-    ; 读取执行设置
-    countStr := Trim(executionCountInput.Value)
-    if (countStr == "" || countStr == "0") {
-        maxExecutionCount := 0  ; 无限次
-    } else if (IsInteger(countStr) && Integer(countStr) > 0) {
-        maxExecutionCount := Integer(countStr)
-    } else {
-        MsgBox("执行次数必须是大于0的整数！", "提示", "Icon!")
-        return
-    }
-    
     isLoopMode := loopCheckbox.Value
     
-    ; 如果是从暂停状态继续，不重置索引和计数
+    ; 如果是从暂停状态继续，不重置索引
     if (currentIndex == 0) {
         currentIndex := 0
-        executionCount := 0
     }
     
     isRunning := true
@@ -356,14 +338,12 @@ StartExecution(*) {
     addBtn.Enabled := false
     deleteBtn.Enabled := false
     clearBtn.Enabled := false
-    executionCountInput.Enabled := false
     loopCheckbox.Enabled := false
     
     ; 记录开始执行日志
     loopInfo := isLoopMode ? " [循环模式]" : ""
-    countInfo := maxExecutionCount > 0 ? " (共" . maxExecutionCount . "轮)" : " (无限次)"
     AddLog("========== 开始执行 ==========")
-    AddLog("操作总数：" . actionList.Length . " 个" . countInfo . loopInfo)
+    AddLog("操作总数：" . actionList.Length . " 个" . loopInfo)
     
     UpdateStatus("正在执行...")
     
@@ -381,36 +361,19 @@ TimerExecuteAction() {
 
 ; 执行下一个操作
 ExecuteNextAction() {
-    global actionList, isRunning, maxExecutionCount, executionCount, isLoopMode, currentIndex
+    global actionList, isRunning, isLoopMode, currentIndex
     global selectedWindowHwnd, selectedWindowTitle, windowInfoText, timerID
     if (!isRunning) {
         return
     }
     
-    ; 检查执行次数限制
-    if (maxExecutionCount > 0 && executionCount >= maxExecutionCount) {
-        StopExecution()
-        UpdateStatus("已达到执行次数限制（" . maxExecutionCount . "次）！")
-        return
-    }
-    
     ; 如果当前操作索引超出范围，需要判断是否循环
     if (currentIndex >= actionList.Length) {
-        ; 完成一轮执行
-        executionCount++
-        
-        ; 检查是否继续执行
-        if (maxExecutionCount > 0 && executionCount >= maxExecutionCount) {
-            StopExecution()
-            UpdateStatus("已完成 " . executionCount . " 次执行！")
-            return
-        }
-        
         ; 如果启用循环模式，重新开始
         if (isLoopMode) {
             currentIndex := 0
-            AddLog("第 " . executionCount . " 轮完成，开始下一轮...")
-            UpdateStatus("第 " . executionCount . " 轮完成，开始下一轮...")
+            AddLog("一轮完成，开始下一轮...")
+            UpdateStatus("一轮完成，开始下一轮...")
             ; 继续执行第一个操作（延迟100ms后）
             SetTimer(TimerExecuteAction, -100)
             return
@@ -484,24 +447,11 @@ ExecuteNextAction() {
         if (isLoopMode) {
             loopInfo := " [循环模式]"
         }
-        countInfo := ""
-        if (maxExecutionCount > 0) {
-            ; 显示当前正在执行的轮次（已完成轮次+1）
-            currentRound := executionCount + 1
-            countInfo := " (第" . currentRound . "/" . maxExecutionCount . "轮)"
-        } else if (isLoopMode) {
-            countInfo := " (第" . (executionCount + 1) . "轮)"
-        }
         ; 记录执行日志
         logMessage := "执行操作 " . (currentIndex + 1) . "/" . actionList.Length . ": " . action.key . sendTarget
-        if (maxExecutionCount > 0) {
-            logMessage .= " (第" . (executionCount + 1) . "/" . maxExecutionCount . "轮)"
-        } else if (isLoopMode) {
-            logMessage .= " (第" . (executionCount + 1) . "轮)"
-        }
         AddLog(logMessage)
         
-        UpdateStatus("执行中：第 " . (currentIndex + 1) . "/" . actionList.Length . " 个操作 - " . action.key . countInfo . loopInfo)
+        UpdateStatus("执行中：第 " . (currentIndex + 1) . "/" . actionList.Length . " 个操作 - " . action.key . loopInfo)
     } catch as e {
         UpdateStatus("执行错误：" . e.Message)
     }
@@ -518,34 +468,18 @@ ExecuteNextAction() {
         SetTimer(TimerExecuteAction, -nextAction.interval)
     } else {
         ; 当前轮次的所有操作执行完毕
-        executionCount++
-        
-        ; 检查是否达到执行次数限制
-        if (maxExecutionCount > 0 && executionCount >= maxExecutionCount) {
-            AddLog("========== 执行完成 ==========")
-            AddLog("已完成 " . executionCount . "/" . maxExecutionCount . " 轮执行")
-            StopExecution()
-            UpdateStatus("已完成 " . executionCount . "/" . maxExecutionCount . " 次执行！")
-            return
-        }
-        
         ; 如果启用循环模式，重新开始下一轮
         if (isLoopMode) {
             currentIndex := 0
-            AddLog("第 " . executionCount . " 轮完成，开始下一轮...")
-            UpdateStatus("第 " . executionCount . " 轮完成，开始下一轮...")
+            AddLog("一轮完成，开始下一轮...")
+            UpdateStatus("一轮完成，开始下一轮...")
             ; 使用单一计时器继续执行第一个操作（延迟100ms后）
             SetTimer(TimerExecuteAction, -100)
         } else {
             ; 不循环，执行完毕
             AddLog("========== 执行完成 ==========")
-            AddLog("已完成 " . executionCount . " 轮执行")
             StopExecution()
-            if (maxExecutionCount > 0) {
-                UpdateStatus("已完成 " . executionCount . "/" . maxExecutionCount . " 次执行！")
-            } else {
-                UpdateStatus("所有操作执行完毕！")
-            }
+            UpdateStatus("所有操作执行完毕！")
         }
     }
 }
@@ -571,18 +505,17 @@ PauseExecution(*) {
 
 ; 停止执行
 StopExecution(*) {
-    global isRunning, currentIndex, executionCount, actionList
+    global isRunning, currentIndex, actionList
     isRunning := false
     
     ; 记录停止日志
-    if (currentIndex > 0 || executionCount > 0) {
-        AddLog("执行已停止 (已完成: " . executionCount . "轮, 当前进度: 第" . currentIndex . "/" . actionList.Length . "个操作)")
+    if (currentIndex > 0) {
+        AddLog("执行已停止 (当前进度: 第" . currentIndex . "/" . actionList.Length . "个操作)")
     } else {
         AddLog("执行已停止")
     }
     
     currentIndex := 0
-    executionCount := 0
     SetTimer(TimerExecuteAction, 0)  ; 停止单一计时器
     
     ; 更新按钮状态
@@ -593,7 +526,6 @@ StopExecution(*) {
     addBtn.Enabled := true
     deleteBtn.Enabled := true
     clearBtn.Enabled := true
-    executionCountInput.Enabled := true
     loopCheckbox.Enabled := true
     
     ; 取消选择
