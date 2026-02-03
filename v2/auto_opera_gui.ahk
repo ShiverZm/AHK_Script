@@ -25,14 +25,15 @@ if (!A_IsAdmin) {
 ; 全局变量
 global actionList := []  ; 存储操作列表
 global isRunning := false  ; 是否正在执行
-global currentIndex := 0  ; 当前执行的操作索引
 global timerID := 0  ; 定时器ID
 global isLoopMode := false  ; 是否循环执行
 global selectedWindowHwnd := 0  ; 选中的窗口句柄
 global selectedWindowTitle := ""  ; 选中的窗口标题
+global startTime := 0  ; 开始执行的时间戳（毫秒）
+global isWindowHidden := false  ; 窗口是否隐藏
 
 ; 创建GUI窗口
-MyGui := Gui("+Resize", "自动化操作控制面板")
+global MyGui := Gui("+Resize", "自动化操作控制面板")
 MyGui.SetFont("s10", "Microsoft YaHei UI")
 
 ; 按键输入区域
@@ -107,10 +108,83 @@ clearLogBtn.OnEvent("Click", ClearLog)
 actionListView.OnEvent("DoubleClick", EditAction)
 
 ; 窗口关闭事件
-MyGui.OnEvent("Close", (*) => ExitApp())
+MyGui.OnEvent("Close", GuiClose)
 
 ; 显示窗口（调整大小以适应左右布局：左侧320px + 右侧350px + 间距）
 MyGui.Show("w690 h700")
+
+; 注册全局热键
+Hotkey("^F1", StartExecution, "On")  ; Ctrl+F1: 开始执行
+Hotkey("^F2", PauseExecution, "On")  ; Ctrl+F2: 暂停执行
+Hotkey("^F3", StopExecution, "On")    ; Ctrl+F3: 停止执行
+Hotkey("^F4", ToggleWindowVisibility, "On")  ; Ctrl+F4: 切换窗口显示/隐藏
+Hotkey("^Esc", QuitApp, "On")  ; Ctrl+Esc: 退出程序
+
+; 添加初始日志提示
+Sleep(100)  ; 等待GUI完全显示
+AddLog("程序已启动")
+AddLog("快捷键：Ctrl+F1=开始执行, Ctrl+F2=暂停, Ctrl+F3=停止, Ctrl+F4=显示/隐藏窗口, Ctrl+Esc=退出程序")
+
+; 退出程序函数
+QuitApp(*) {
+    Hotkey("^F1", "Off")
+    Hotkey("^F2", "Off")
+    Hotkey("^F3", "Off")
+    Hotkey("^F4", "Off")
+    Hotkey("^Esc", "Off")
+    ExitApp()
+}
+
+; GUI关闭时取消热键注册
+GuiClose(*) {
+    QuitApp()
+}
+
+; 切换窗口显示/隐藏
+ToggleWindowVisibility(*) {
+    global MyGui, isWindowHidden
+    try {
+        if (!IsSet(MyGui) || !MyGui) {
+            return
+        }
+        
+        ; 检查窗口是否存在
+        if (WinExist("ahk_id " . MyGui.Hwnd)) {
+            ; 窗口存在，检查是否可见
+            ; 使用WinGetMinMax检查窗口状态：1=最大化, 0=正常, -1=最小化
+            minMaxState := WinGetMinMax("ahk_id " . MyGui.Hwnd)
+            
+            ; 检查窗口是否可见（使用WinGetStyle检查WS_VISIBLE标志）
+            ; WS_VISIBLE = 0x10000000
+            style := WinGetStyle("ahk_id " . MyGui.Hwnd)
+            isVisible := (style & 0x10000000) != 0
+            
+            if (!isVisible || minMaxState == -1) {
+                ; 窗口被隐藏或最小化，显示它
+                MyGui.Show()
+                if (minMaxState == -1) {
+                    MyGui.Restore()
+                }
+                WinActivate("ahk_id " . MyGui.Hwnd)
+                isWindowHidden := false
+                AddLog("窗口已显示")
+            } else {
+                ; 窗口正常显示，隐藏它
+                MyGui.Hide()
+                isWindowHidden := true
+                AddLog("窗口已隐藏到托盘")
+            }
+        } else {
+            ; 窗口不存在或被隐藏，显示它
+            MyGui.Show()
+            WinActivate("ahk_id " . MyGui.Hwnd)
+            isWindowHidden := false
+            AddLog("窗口已显示")
+        }
+    } catch {
+        ; 忽略错误
+    }
+}
 
 ; ============================================================================
 ; 函数定义
@@ -208,8 +282,8 @@ AddAction(*) {
         return
     }
     
-    ; 添加到列表
-    actionList.Push({key: key, interval: Integer(interval)})
+    ; 添加到列表（添加lastExecuteTime字段，初始为-1表示未执行过）
+    actionList.Push({key: key, interval: Integer(interval), lastExecuteTime: -1})
     
     ; 更新ListView
     actionListView.Add("", key, interval)
@@ -292,9 +366,10 @@ EditAction(LV, Row) {
             return
         }
         
-        ; 更新列表
+        ; 更新列表（保留lastExecuteTime字段）
         oldKey := actionList[Row].key
-        actionList[Row] := {key: newKey, interval: Integer(newInterval)}
+        oldLastExecuteTime := actionList[Row].lastExecuteTime
+        actionList[Row] := {key: newKey, interval: Integer(newInterval), lastExecuteTime: oldLastExecuteTime}
         actionListView.Modify(Row, "", newKey, newInterval)
         
         AddLog("更新操作: " . oldKey . " -> " . newKey . " (间隔: " . newInterval . "ms)")
@@ -305,7 +380,8 @@ EditAction(LV, Row) {
 
 ; 开始执行
 StartExecution(*) {
-    global actionList, isRunning, isLoopMode, currentIndex
+    global actionList, isRunning, isLoopMode, startTime
+    global loopCheckbox, startBtn, pauseBtn, stopBtn, addBtn, deleteBtn, clearBtn
     
     if (actionList.Length == 0) {
         MsgBox("请先添加操作！", "提示", "Icon!")
@@ -322,214 +398,281 @@ StartExecution(*) {
         isRunning := false
     }
     
-    isLoopMode := loopCheckbox.Value
+    try {
+        if (IsSet(loopCheckbox) && loopCheckbox) {
+            isLoopMode := loopCheckbox.Value
+        } else {
+            isLoopMode := false
+        }
+    } catch {
+        isLoopMode := false
+    }
     
-    ; 如果是从暂停状态继续，不重置索引
-    if (currentIndex == 0) {
-        currentIndex := 0
+    ; 如果是继续执行（从暂停状态恢复），调整startTime
+    ; 检查是否有操作未执行过，如果有，需要更新startTime
+    hasUnExecuted := false
+    for i, action in actionList {
+        if (action.lastExecuteTime == -1) {
+            hasUnExecuted := true
+            break
+        }
+    }
+    
+    ; 如果有未执行的操作，更新startTime为当前时间
+    if (hasUnExecuted) {
+        ; 初始化所有操作的lastExecuteTime为-1（表示未执行过）
+        for i, action in actionList {
+            action.lastExecuteTime := -1
+        }
+        ; 记录开始执行时间（毫秒）
+        startTime := A_TickCount
     }
     
     isRunning := true
     
     ; 更新按钮状态
-    startBtn.Enabled := false
-    pauseBtn.Enabled := true
-    stopBtn.Enabled := true
-    addBtn.Enabled := false
-    deleteBtn.Enabled := false
-    clearBtn.Enabled := false
-    loopCheckbox.Enabled := false
+    try {
+        if (IsSet(startBtn) && startBtn) {
+            startBtn.Enabled := false
+        }
+        if (IsSet(pauseBtn) && pauseBtn) {
+            pauseBtn.Enabled := true
+        }
+        if (IsSet(stopBtn) && stopBtn) {
+            stopBtn.Enabled := true
+        }
+        if (IsSet(addBtn) && addBtn) {
+            addBtn.Enabled := false
+        }
+        if (IsSet(deleteBtn) && deleteBtn) {
+            deleteBtn.Enabled := false
+        }
+        if (IsSet(clearBtn) && clearBtn) {
+            clearBtn.Enabled := false
+        }
+        if (IsSet(loopCheckbox) && loopCheckbox) {
+            loopCheckbox.Enabled := false
+        }
+    } catch {
+        ; GUI可能已关闭，忽略错误
+    }
     
     ; 记录开始执行日志
     loopInfo := isLoopMode ? " [循环模式]" : ""
-    AddLog("========== 开始执行 ==========")
-    AddLog("操作总数：" . actionList.Length . " 个" . loopInfo)
+    if (hasUnExecuted) {
+        AddLog("========== 开始执行 ==========")
+        AddLog("操作总数：" . actionList.Length . " 个" . loopInfo)
+        AddLog("执行模式：基于间隔时间执行（每秒检查一次）")
+    } else {
+        AddLog("========== 继续执行 ==========")
+    }
     
     UpdateStatus("正在执行...")
     
-    ; 启动单一计时器，立即执行第一个操作
-    ; 停止之前的计时器（如果存在）
-    SetTimer(TimerExecuteAction, 0)
-    ; 立即执行第一个操作
-    ExecuteNextAction()
+    ; 启动1秒计时器，每秒检查一次所有操作
+    SetTimer(TimerCheckActions, 1000)
 }
 
-; 单一计时器执行函数
-TimerExecuteAction() {
-    ExecuteNextAction()
-}
-
-; 执行下一个操作
-ExecuteNextAction() {
-    global actionList, isRunning, isLoopMode, currentIndex
-    global selectedWindowHwnd, selectedWindowTitle, windowInfoText, timerID
+; 计时器检查函数（每秒执行一次）
+TimerCheckActions() {
+    global actionList, isRunning, isLoopMode, startTime
+    global selectedWindowHwnd, selectedWindowTitle, windowInfoText
+    global actionListView
+    
     if (!isRunning) {
         return
     }
     
-    ; 如果当前操作索引超出范围，需要判断是否循环
-    if (currentIndex >= actionList.Length) {
-        ; 如果启用循环模式，重新开始
-        if (isLoopMode) {
-            currentIndex := 0
-            AddLog("一轮完成，开始下一轮...")
-            UpdateStatus("一轮完成，开始下一轮...")
-            ; 继续执行第一个操作（延迟100ms后）
-            SetTimer(TimerExecuteAction, -100)
-            return
-        } else {
-            ; 不循环，执行完毕
-            StopExecution()
-            AddLog("所有操作执行完毕！")
-            UpdateStatus("所有操作执行完毕！")
-            return
-        }
-    }
+    ; 获取当前时间（毫秒）
+    currentTime := A_TickCount
     
-    ; 获取当前操作
-    action := actionList[currentIndex + 1]
-    
-    ; 高亮当前执行的操作
-    actionListView.Modify(currentIndex + 1, "Select")
-    
-    ; 执行按键操作
-    try {
-        keyStr := Trim(action.key)
+    ; 遍历所有操作，检查是否到了执行时间
+    for i, action in actionList {
+        ; 判断是否需要执行
+        shouldExecute := false
         
-        ; 转换常见的组合键格式（支持 Ctrl、Alt、Shift、Win）
-        keyStr := StrReplace(keyStr, "Ctrl+", "^")
-        keyStr := StrReplace(keyStr, "Alt+", "!")
-        keyStr := StrReplace(keyStr, "Shift+", "+")
-        keyStr := StrReplace(keyStr, "Win+", "#")
-        keyStr := StrReplace(keyStr, "ctrl+", "^")
-        keyStr := StrReplace(keyStr, "alt+", "!")
-        keyStr := StrReplace(keyStr, "shift+", "+")
-        keyStr := StrReplace(keyStr, "win+", "#")
-        
-        ; 判断是否需要大括号包裹
-        ; 如果已经包含特殊字符（^!+#）或大括号，直接发送
-        ; 否则用大括号包裹
-        formattedKey := ""
-        if (InStr(keyStr, "^") || InStr(keyStr, "!") || InStr(keyStr, "#") || InStr(keyStr, "{") || InStr(keyStr, "}")) {
-            ; 组合键或已格式化的按键，直接使用
-            formattedKey := keyStr
-        } else {
-            ; 普通按键，用大括号包裹
-            formattedKey := "{" . keyStr . "}"
-        }
-        
-        ; 如果选择了窗口，向指定窗口发送按键；否则发送到当前活动窗口
-        sendTarget := ""
-        if (selectedWindowHwnd != 0) {
-            ; 检查窗口是否仍然存在
-            if (WinExist("ahk_id " . selectedWindowHwnd)) {
-                ; 向指定窗口发送按键（使用BestSendKey，Method 6 = ControlSend）
-                BestSendKey(formattedKey, selectedWindowHwnd)
-                sendTarget := " [发送到: " . selectedWindowTitle . "]"
-            } else {
-                ; 窗口已关闭，清除选择并发送到当前活动窗口
-                AddLog("警告：选中的窗口已关闭，已清除窗口选择")
-                selectedWindowHwnd := 0
-                selectedWindowTitle := ""
-                windowInfoText.Value := "未选择窗口（将发送到当前活动窗口）"
-                windowInfoText.SetFont("cGray")
-                Send(formattedKey)
-                sendTarget := " [发送到当前活动窗口]"
+        if (action.lastExecuteTime == -1) {
+            ; 如果从未执行过，检查是否到了第一次执行的时间
+            ; 计算从开始执行到现在经过的时间（毫秒）
+            elapsedTime := currentTime - startTime
+            
+            ; 如果间隔为0，立即执行；否则等待间隔时间
+            if (action.interval == 0) {
+                shouldExecute := true
+            } else if (elapsedTime >= action.interval) {
+                shouldExecute := true
             }
         } else {
-            ; 发送到当前活动窗口
-            Send(formattedKey)
-            sendTarget := " [发送到当前活动窗口]"
+            ; 如果已经执行过，检查是否到了下次执行的时间
+            timeSinceLastExecute := currentTime - action.lastExecuteTime
+            if (timeSinceLastExecute >= action.interval) {
+                shouldExecute := true
+            }
         }
         
-        ; 更新状态显示
-        loopInfo := ""
-        if (isLoopMode) {
-            loopInfo := " [循环模式]"
-        }
-        ; 记录执行日志
-        logMessage := "执行操作 " . (currentIndex + 1) . "/" . actionList.Length . ": " . action.key . sendTarget
-        AddLog(logMessage)
-        
-        UpdateStatus("执行中：第 " . (currentIndex + 1) . "/" . actionList.Length . " 个操作 - " . action.key . loopInfo)
-    } catch as e {
-        UpdateStatus("执行错误：" . e.Message)
-    }
-    
-    ; 移动到下一个操作
-    currentIndex++
-    
-    ; 如果还有操作，使用单一计时器执行下一个
-    if (currentIndex < actionList.Length) {
-        nextAction := actionList[currentIndex + 1]
-        ; 停止之前的计时器（如果存在）
-        SetTimer(TimerExecuteAction, 0)
-        ; 设置新的计时器，使用单一计时器函数
-        SetTimer(TimerExecuteAction, -nextAction.interval)
-    } else {
-        ; 当前轮次的所有操作执行完毕
-        ; 如果启用循环模式，重新开始下一轮
-        if (isLoopMode) {
-            currentIndex := 0
-            AddLog("一轮完成，开始下一轮...")
-            UpdateStatus("一轮完成，开始下一轮...")
-            ; 使用单一计时器继续执行第一个操作（延迟100ms后）
-            SetTimer(TimerExecuteAction, -100)
-        } else {
-            ; 不循环，执行完毕
-            AddLog("========== 执行完成 ==========")
-            StopExecution()
-            UpdateStatus("所有操作执行完毕！")
+        ; 如果需要执行
+        if (shouldExecute) {
+            ; 高亮当前执行的操作
+            try {
+                if (IsSet(actionListView) && actionListView) {
+                    actionListView.Modify(i, "Select")
+                }
+            } catch {
+                ; GUI可能已关闭，忽略错误
+            }
+            
+            ; 执行按键操作
+            try {
+                keyStr := Trim(action.key)
+                
+                ; 转换常见的组合键格式（支持 Ctrl、Alt、Shift、Win）
+                keyStr := StrReplace(keyStr, "Ctrl+", "^")
+                keyStr := StrReplace(keyStr, "Alt+", "!")
+                keyStr := StrReplace(keyStr, "Shift+", "+")
+                keyStr := StrReplace(keyStr, "Win+", "#")
+                keyStr := StrReplace(keyStr, "ctrl+", "^")
+                keyStr := StrReplace(keyStr, "alt+", "!")
+                keyStr := StrReplace(keyStr, "shift+", "+")
+                keyStr := StrReplace(keyStr, "win+", "#")
+                
+                ; 判断是否需要大括号包裹
+                formattedKey := ""
+                if (InStr(keyStr, "^") || InStr(keyStr, "!") || InStr(keyStr, "#") || InStr(keyStr, "{") || InStr(keyStr, "}")) {
+                    formattedKey := keyStr
+                } else {
+                    formattedKey := "{" . keyStr . "}"
+                }
+                
+                ; 如果选择了窗口，向指定窗口发送按键；否则发送到当前活动窗口
+                sendTarget := ""
+                if (selectedWindowHwnd != 0) {
+                    if (WinExist("ahk_id " . selectedWindowHwnd)) {
+                        BestSendKey(formattedKey, selectedWindowHwnd)
+                        sendTarget := " [发送到: " . selectedWindowTitle . "]"
+                    } else {
+                        AddLog("警告：选中的窗口已关闭，已清除窗口选择")
+                        selectedWindowHwnd := 0
+                        selectedWindowTitle := ""
+                        try {
+                            global MyGui
+                            ; 检查 GUI 窗口是否存在
+                            if (IsSet(MyGui) && MyGui) {
+                                try {
+                                    if (WinExist("ahk_id " . MyGui.Hwnd)) {
+                                        if (IsSet(windowInfoText) && windowInfoText) {
+                                            windowInfoText.Value := "未选择窗口（将发送到当前活动窗口）"
+                                            windowInfoText.SetFont("cGray")
+                                        }
+                                    }
+                                } catch {
+                                    ; GUI窗口可能已关闭，忽略错误
+                                }
+                            }
+                        } catch {
+                            ; GUI可能已关闭，忽略错误
+                        }
+                        Send(formattedKey)
+                        sendTarget := " [发送到当前活动窗口]"
+                    }
+                } else {
+                    Send(formattedKey)
+                    sendTarget := " [发送到当前活动窗口]"
+                }
+                
+                ; 更新lastExecuteTime
+                action.lastExecuteTime := currentTime
+                
+                ; 记录执行日志
+                logMessage := "执行操作 #" . i . ": " . action.key . " (间隔: " . action.interval . "ms)" . sendTarget
+                AddLog(logMessage)
+                
+                ; 更新状态显示
+                loopInfo := isLoopMode ? " [循环模式]" : ""
+                UpdateStatus("执行中：操作 #" . i . " - " . action.key . loopInfo)
+            } catch as e {
+                AddLog("执行错误 #" . i . ": " . e.Message)
+                UpdateStatus("执行错误：" . e.Message)
+            }
         }
     }
 }
 
 ; 暂停执行
 PauseExecution(*) {
-    global isRunning, currentIndex, actionList
+    global isRunning, actionList
+    global startBtn, pauseBtn
     if (!isRunning) {
         return
     }
     
     isRunning := false
-    SetTimer(TimerExecuteAction, 0)  ; 停止单一计时器
+    SetTimer(TimerCheckActions, 0)  ; 停止计时器
     
-    AddLog("执行已暂停 (当前进度: 第" . (currentIndex) . "/" . actionList.Length . "个操作)")
+    AddLog("执行已暂停")
     
-    startBtn.Enabled := true
-    startBtn.Text := "继续执行"
-    pauseBtn.Enabled := false
+    try {
+        if (IsSet(startBtn) && startBtn) {
+            startBtn.Enabled := true
+            startBtn.Text := "继续执行"
+        }
+        if (IsSet(pauseBtn) && pauseBtn) {
+            pauseBtn.Enabled := false
+        }
+    } catch {
+        ; GUI可能已关闭，忽略错误
+    }
     
     UpdateStatus("已暂停（可点击'继续执行'恢复）")
 }
 
 ; 停止执行
 StopExecution(*) {
-    global isRunning, currentIndex, actionList
+    global isRunning, actionList
+    global startBtn, pauseBtn, stopBtn, addBtn, deleteBtn, clearBtn, loopCheckbox
+    global actionListView
     isRunning := false
     
     ; 记录停止日志
-    if (currentIndex > 0) {
-        AddLog("执行已停止 (当前进度: 第" . currentIndex . "/" . actionList.Length . "个操作)")
-    } else {
-        AddLog("执行已停止")
+    AddLog("执行已停止")
+    
+    ; 重置所有操作的lastExecuteTime
+    for i, action in actionList {
+        action.lastExecuteTime := -1
     }
     
-    currentIndex := 0
-    SetTimer(TimerExecuteAction, 0)  ; 停止单一计时器
+    SetTimer(TimerCheckActions, 0)  ; 停止计时器
     
     ; 更新按钮状态
-    startBtn.Enabled := true
-    startBtn.Text := "开始执行"
-    pauseBtn.Enabled := true
-    stopBtn.Enabled := false
-    addBtn.Enabled := true
-    deleteBtn.Enabled := true
-    clearBtn.Enabled := true
-    loopCheckbox.Enabled := true
-    
-    ; 取消选择
-    actionListView.Modify(0, "-Select")
+    try {
+        if (IsSet(startBtn) && startBtn) {
+            startBtn.Enabled := true
+            startBtn.Text := "开始执行"
+        }
+        if (IsSet(pauseBtn) && pauseBtn) {
+            pauseBtn.Enabled := true
+        }
+        if (IsSet(stopBtn) && stopBtn) {
+            stopBtn.Enabled := false
+        }
+        if (IsSet(addBtn) && addBtn) {
+            addBtn.Enabled := true
+        }
+        if (IsSet(deleteBtn) && deleteBtn) {
+            deleteBtn.Enabled := true
+        }
+        if (IsSet(clearBtn) && clearBtn) {
+            clearBtn.Enabled := true
+        }
+        if (IsSet(loopCheckbox) && loopCheckbox) {
+            loopCheckbox.Enabled := true
+        }
+        ; 取消选择
+        if (IsSet(actionListView) && actionListView) {
+            actionListView.Modify(0, "-Select")
+        }
+    } catch {
+        ; GUI可能已关闭，忽略错误
+    }
     
     UpdateStatus("已停止")
 }
@@ -647,8 +790,8 @@ ImportActions(*) {
                 if (key != "" && IsInteger(intervalStr) && Integer(intervalStr) >= 0) {
                     interval := Integer(intervalStr)
                     
-                    ; 添加到列表
-                    actionList.Push({key: key, interval: interval})
+                    ; 添加到列表（添加lastExecuteTime字段）
+                    actionList.Push({key: key, interval: interval, lastExecuteTime: -1})
                     actionListView.Add("", key, interval)
                     importedCount++
                 } else {
@@ -680,28 +823,70 @@ ImportActions(*) {
 
 ; 更新状态
 UpdateStatus(message) {
-    statusText.Value := "状态：" . message
+    try {
+        global statusText, MyGui
+        ; 检查 GUI 窗口是否存在
+        if (!IsSet(MyGui) || !MyGui) {
+            return
+        }
+        ; 检查窗口是否仍然存在
+        try {
+            if (!WinExist("ahk_id " . MyGui.Hwnd)) {
+                return
+            }
+        } catch {
+            return
+        }
+        ; 检查控件是否存在
+        if (IsSet(statusText) && statusText) {
+            statusText.Value := "状态：" . message
+        }
+    } catch {
+        ; GUI可能已关闭，忽略错误
+    }
 }
 
 ; 添加日志
 AddLog(message) {
-    ; 获取当前时间（AutoHotkey v2语法）
-    currentTime := FormatTime(, "yyyy-MM-dd HH:mm:ss")
-    
-    ; 添加到日志显示区域
-    logText := logDisplay.Value
-    if (logText != "") {
-        logText .= "`r`n"
+    try {
+        global logDisplay, MyGui
+        ; 检查 GUI 窗口是否存在
+        if (!IsSet(MyGui) || !MyGui) {
+            return
+        }
+        ; 检查窗口是否仍然存在
+        try {
+            if (!WinExist("ahk_id " . MyGui.Hwnd)) {
+                return
+            }
+        } catch {
+            return
+        }
+        ; 检查控件是否存在
+        if (!IsSet(logDisplay) || !logDisplay) {
+            return
+        }
+        
+        ; 获取当前时间（AutoHotkey v2语法）
+        currentTime := FormatTime(, "yyyy-MM-dd HH:mm:ss")
+        
+        ; 添加到日志显示区域
+        logText := logDisplay.Value
+        if (logText != "") {
+            logText .= "`r`n"
+        }
+        logText .= "[" . currentTime . "] " . message
+        
+        logDisplay.Value := logText
+        
+        ; 自动滚动到底部
+        ; 使用SendMessage设置选择位置到末尾并滚动
+        textLength := StrLen(logText)
+        SendMessage(0xB1, textLength, textLength, , logDisplay)  ; EM_SETSEL - 设置选择范围
+        SendMessage(0xB7, 0, 0, , logDisplay)  ; EM_SCROLLCARET - 滚动到插入符位置
+    } catch {
+        ; GUI可能已关闭，忽略错误
     }
-    logText .= "[" . currentTime . "] " . message
-    
-    logDisplay.Value := logText
-    
-    ; 自动滚动到底部
-    ; 使用SendMessage设置选择位置到末尾并滚动
-    textLength := StrLen(logText)
-    SendMessage(0xB1, textLength, textLength, , logDisplay)  ; EM_SETSEL - 设置选择范围
-    SendMessage(0xB7, 0, 0, , logDisplay)  ; EM_SCROLLCARET - 滚动到插入符位置
 }
 
 ; 清空日志
@@ -912,8 +1097,24 @@ SelectWindow(*) {
         if (StrLen(displayText) > 50) {
             displayText := SubStr(displayText, 1, 47) . "..."
         }
-        windowInfoText.Value := displayText
-        windowInfoText.SetFont("cGreen")
+        try {
+            global MyGui
+            ; 检查 GUI 窗口是否存在
+            if (IsSet(MyGui) && MyGui) {
+                try {
+                    if (WinExist("ahk_id " . MyGui.Hwnd)) {
+                        if (IsSet(windowInfoText) && windowInfoText) {
+                            windowInfoText.Value := displayText
+                            windowInfoText.SetFont("cGreen")
+                        }
+                    }
+                } catch {
+                    ; GUI窗口可能已关闭，忽略错误
+                }
+            }
+        } catch {
+            ; GUI可能已关闭，忽略错误
+        }
         
         AddLog("已选择窗口: " . windowTitle . " (句柄: " . mouseHwnd . ")")
         UpdateStatus("已选择目标窗口：" . windowTitle)
@@ -925,11 +1126,26 @@ SelectWindow(*) {
 
 ; 清除窗口选择
 ClearWindowSelection(*) {
-    global selectedWindowHwnd, selectedWindowTitle, windowInfoText
+    global selectedWindowHwnd, selectedWindowTitle, windowInfoText, MyGui
     selectedWindowHwnd := 0
     selectedWindowTitle := ""
-    windowInfoText.Value := "未选择窗口（将发送到当前活动窗口）"
-    windowInfoText.SetFont("cGray")
+    try {
+        ; 检查 GUI 窗口是否存在
+        if (IsSet(MyGui) && MyGui) {
+            try {
+                if (WinExist("ahk_id " . MyGui.Hwnd)) {
+                    if (IsSet(windowInfoText) && windowInfoText) {
+                        windowInfoText.Value := "未选择窗口（将发送到当前活动窗口）"
+                        windowInfoText.SetFont("cGray")
+                    }
+                }
+            } catch {
+                ; GUI窗口可能已关闭，忽略错误
+            }
+        }
+    } catch {
+        ; GUI可能已关闭，忽略错误
+    }
     AddLog("已清除窗口选择")
     UpdateStatus("已清除窗口选择")
 }
